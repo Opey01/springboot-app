@@ -1,85 +1,100 @@
 pipeline {
   agent any
-  options { timestamps(); ansiColor('xterm') }
+  options { timestamps(); skipDefaultCheckout(true) }
 
   environment {
-    // === GIT ===
-    GIT_URL       = 'https://github.com/Opey01/springboot-app.git' // default branch used
+    AWS_REGION   = 'us-east-2'
+    ACCOUNT_ID   = '850924742604'
+    ECR_REPO     = 'mydockerrepo'
+    REGISTRY     = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    IMAGE_TAG    = "build-${BUILD_NUMBER}"
+    IMAGE_URI    = "${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
 
-    // === AWS / ECR ===
-    AWS_REGION    = 'us-east-2'
-    ACCOUNT_ID    = '850924742604'
-    ECR_REPO_NAME = 'mydockerrepo'
-    REGISTRY      = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    // ← keep your existing POM here
+    POM_PATH         = 'MyAwesomeApp/pom.xml'
 
-    // === Build paths (adjust if needed) ===
-    POM_PATH        = 'MyAwesomeApp/pom.xml'
-    DOCKERFILE_PATH = 'Dockerfile'   // or 'MyAwesomeApp/Dockerfile'
-    BUILD_CONTEXT   = '.'            // or 'MyAwesomeApp'
+    // Adjust these two depending on where your Dockerfile lives (see notes below)
+    DOCKERFILE_PATH  = 'Dockerfile'
+    BUILD_CONTEXT    = '.'
+
+    // If your agent uses an IAM role for ECR, leave empty. Otherwise put your Jenkins AWS creds ID here.
+    AWS_CREDENTIALS_ID = ''
   }
 
   stages {
     stage('Checkout') {
       steps {
-        deleteDir()
-        git url: env.GIT_URL
+        // Force GitHub (this prevents Jenkins from using an old Bitbucket SCM config)
+        git url: 'https://github.com/Opey01/springboot-app.git', branch: 'main'
       }
     }
 
-    stage('Prepare Tag') {
+    stage('Build (Maven)') {
       steps {
-        script {
-          def sha = sh(returnStdout: true, script: 'git rev-parse --short=12 HEAD').trim()
-          env.IMAGE_TAG = "${sha}-${BUILD_NUMBER}"                   // immutable
-          env.IMAGE_URI = "${REGISTRY}/${ECR_REPO_NAME}:${IMAGE_TAG}"
-          echo "IMAGE_URI = ${env.IMAGE_URI}"
-        }
+        sh 'mvn -f ${POM_PATH} -B -DskipTests clean package'
       }
     }
 
-    stage('Build JAR') {
+    stage('Archive Jar') {
       steps {
-        sh 'mvn -f "$POM_PATH" -B clean install'
+        archiveArtifacts artifacts: 'MyAwesomeApp/target/*.jar', fingerprint: true
       }
     }
 
     stage('Docker Build') {
       steps {
-        sh 'docker build -t "$IMAGE_URI" -f "$DOCKERFILE_PATH" "$BUILD_CONTEXT"'
+        sh '''
+          docker build -f ${DOCKERFILE_PATH} -t ${ECR_REPO}:${IMAGE_TAG} ${BUILD_CONTEXT}
+          docker tag ${ECR_REPO}:${IMAGE_TAG} ${IMAGE_URI}
+        '''
       }
     }
 
-    stage('Trivy Security Scan') {
+    stage('Trivy Scan') {
       steps {
         sh '''
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $WORKSPACE/.trivy-cache:/root/.cache/ \
             aquasec/trivy:latest image \
             --severity HIGH,CRITICAL \
             --no-progress \
             --exit-code 1 \
-            "$IMAGE_URI"
+            ${IMAGE_URI}
         '''
       }
     }
 
-    stage('Login & Push to ECR') {
+    stage('ECR Login & Push') {
       steps {
-        sh '''
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$REGISTRY"
+        script {
+          def loginAndPush = {
+            sh '''
+              aws ecr get-login-password --region "$AWS_REGION" \
+                | docker login --username AWS --password-stdin "$REGISTRY"
 
-          docker push "$IMAGE_URI"
-        '''
+              docker push "$IMAGE_URI"
+
+              docker tag "${ECR_REPO}:${IMAGE_TAG}" "${REGISTRY}/${ECR_REPO}:latest"
+              docker push "${REGISTRY}/${ECR_REPO}:latest"
+            '''
+          }
+          if (env.AWS_CREDENTIALS_ID?.trim()) {
+            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                              credentialsId: env.AWS_CREDENTIALS_ID]]) { loginAndPush() }
+          } else { loginAndPush() }
+        }
       }
     }
   }
 
   post {
     always {
-      sh 'docker logout "$REGISTRY" || true'
-      archiveArtifacts artifacts: 'MyAwesomeApp/target/*.jar', fingerprint: true, onlyIfSuccessful: false
+      sh 'docker logout ${REGISTRY} || true'
+      cleanWs()
     }
   }
 }
+
 
 
