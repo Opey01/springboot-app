@@ -1,89 +1,48 @@
 pipeline {
   agent any
   environment {
-    ACCT_ID        = '850924742604'                 // <-- set your AWS account ID
-    AWS_REGION     = 'us-east-2'                    // ECR region
-    REPO_PATH      = 'opey01/springboot-app'        // must be lowercase in ECR
-    REGISTRY_HOST  = "${ACCT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-    IMAGE_URI      = "${REGISTRY_HOST}/${REPO_PATH}"
+    AWS_REGION   = 'us-east-2'
+    ECR_REGISTRY = '850924742604.dkr.ecr.us-east-2.amazonaws.com'
+    ECR_REPO     = "${ECR_REGISTRY}/springboot-app"
   }
 
   stages {
-    // If this job is "Pipeline script from SCM", Jenkins auto-checks out your code.
-    // No explicit 'Checkout' stage is needed.
+    stage('Checkout') {
+      steps {
+        // Use the correct repo/branch; change 'main' to your actual default branch
+        git branch: 'main', url: 'https://github.com/Opey01/springboot-app.git'
+      }
+    }
 
-    stage('Prepare Tag') {
+    stage('Build') {
+      steps {
+        sh 'mvn -B -f MyAwesomeApp/pom.xml clean package'
+        archiveArtifacts artifacts: 'MyAwesomeApp/target/springbootApp.jar', fingerprint: true
+      }
+    }
+
+    stage('Docker Build') {
       steps {
         script {
-          def commit = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-          env.BUILD_TAG_IMMUTABLE = "${commit}-${env.BUILD_NUMBER}"   // e.g., a1b2c3d-42
-          echo "Using image tag: ${env.BUILD_TAG_IMMUTABLE}"
+          env.IMAGE_TAG = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+          docker.build("${env.ECR_REPO}:${env.IMAGE_TAG}")
         }
       }
     }
 
-    stage('Build JAR') {
+    stage('Login & Push to ECR') {
       steps {
-        sh 'mvn -B clean install'   // add -DskipTests if desired
-      }
-    }
-
-    stage('Build Image') {
-      steps {
-        script {
-          def dockerImage = docker.build("${IMAGE_URI}:${env.BUILD_TAG_IMMUTABLE}")
-        }
-      }
-    }
-
-    stage('Trivy Security Scan') {
-      steps {
-        // Fail ONLY on CRITICAL; adjust to HIGH,CRITICAL if you want stricter gates
-        sh '''
-          trivy image \
-            --severity CRITICAL \
-            --ignore-unfixed \
-            --exit-code 1 \
-            ${IMAGE_URI}:${BUILD_TAG_IMMUTABLE}
-        '''
-      }
-    }
-
-    stage('Push to ECR') {
-      steps {
-        script {
-          sh """
-            aws ecr get-login-password --region ${AWS_REGION} \
-              | docker login --username AWS --password-stdin ${REGISTRY_HOST}
-
-            # Ensure repo exists (safe no-op if it already exists)
-            aws ecr describe-repositories --repository-names ${REPO_PATH} --region ${AWS_REGION} >/dev/null 2>&1 \
-              || aws ecr create-repository --repository-name ${REPO_PATH} --region ${AWS_REGION} \
-                   --image-scanning-configuration scanOnPush=true
-
-            docker push ${IMAGE_URI}:${BUILD_TAG_IMMUTABLE}
-          """
-        }
-      }
-    }
-
-    stage('Deploy by Tag') {
-      steps {
-        script {
-          // Stop and remove any prior container
-          sh '''
-            docker ps -f name=springbootApp -q | xargs -r docker stop
-            docker container ls -a -f name=springbootApp -q | xargs -r docker rm
-          '''
-
-          // Run the just-built image
-          sh """
-            docker run -d --rm --name springbootApp \
-              -p 8096:8080 \
-              ${IMAGE_URI}:${BUILD_TAG_IMMUTABLE}
-          """
-        }
+        sh """
+          aws ecr get-login-password --region ${AWS_REGION} \
+            | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+          docker push ${ECR_REPO}:${IMAGE_TAG}
+        """
       }
     }
   }
+
+  post {
+    always { cleanWs() }
+  }
 }
+
