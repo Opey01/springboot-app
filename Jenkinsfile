@@ -1,45 +1,96 @@
+pipeline {
+  agent any
+  options { timestamps(); skipDefaultCheckout(true) }
 
-node {
-  
-  def image
-  def mvnHome = tool 'Maven3'
+  environment {
+    AWS_REGION = 'us-east-2'
+    ACCOUNT_ID = '850924742604'
+    ECR_REPO   = 'mydockerrepo'
+    REGISTRY   = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    IMAGE_TAG  = "build-${BUILD_NUMBER}"
+    IMAGE_URI  = "${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
 
-  
-     stage ('checkout') {
-        checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '9ffd4ee4-3647-4a7d-a357-5e8746463282', url: 'https://bitbucket.org/ananthkannan/myawesomeangularapprepo/']]])       
-        }
-    
-    
-    stage ('Build') {
-            sh 'mvn -f MyAwesomeApp/pom.xml clean install'            
-        }
-        
-    stage ('archive') {
-            archiveArtifacts '**/*.jar'
-        }
-        
-    stage ('Docker Build') {
-         // Build and push image with Jenkins' docker-plugin
-        withDockerServer([uri: "tcp://localhost:4243"]) {
+    POM_PATH        = 'MyAwesomeApp/pom.xml'
+    DOCKERFILE_PATH = 'Dockerfilejenkins'
+    BUILD_CONTEXT   = '.'
 
-            withDockerRegistry([credentialsId: "fa32f95a-2d3e-4c7b-8f34-11bcc0191d70", url: "https://index.docker.io/v1/"]) {
-            image = docker.build("ananthkannan/mywebapp", "MyAwesomeApp")
-            image.push()
-            
+    AWS_CREDENTIALS_ID = ''   // set a Jenkins AWS creds ID here only if NOT using instance role
+  }
+
+  stages {
+    stage('Prep (clean workspace)') { steps { deleteDir() } }
+
+    stage('Checkout') {
+      steps {
+        // Explicitly use your GitHub repo + main branch
+        git url: 'https://github.com/Opey01/springboot-app.git', branch: 'main'
+      }
+    }
+
+    stage('Build (Maven)') {
+      steps {
+        sh 'mvn -f ${POM_PATH} -B -DskipTests clean package'
+      }
+    }
+
+    stage('Archive Jar') {
+      steps {
+        archiveArtifacts artifacts: 'MyAwesomeApp/target/*.jar', fingerprint: true
+      }
+    }
+
+    stage('Docker Build & Tag') {
+      steps {
+        sh '''
+          docker build -f ${DOCKERFILE_PATH} -t ${ECR_REPO}:${IMAGE_TAG} ${BUILD_CONTEXT}
+          docker tag ${ECR_REPO}:${IMAGE_TAG} ${IMAGE_URI}
+          docker tag ${ECR_REPO}:${IMAGE_TAG} ${REGISTRY}/${ECR_REPO}:latest
+        '''
+      }
+    }
+
+    stage('Trivy Scan') {
+      steps {
+        sh '''
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $WORKSPACE/.trivy-cache:/root/.cache/ \
+            aquasec/trivy:latest image \
+            --severity HIGH,CRITICAL \
+            --no-progress \
+            --exit-code 1 \
+            ${IMAGE_URI}
+        '''
+      }
+    }
+
+    stage('ECR Login & Push') {
+      steps {
+        script {
+          def pushToEcr = {
+            sh '''
+              aws ecr get-login-password --region "$AWS_REGION" \
+                | docker login --username AWS --password-stdin "$REGISTRY"
+              docker push "${IMAGE_URI}"
+              docker push "${REGISTRY}/${ECR_REPO}:latest"
+            '''
+          }
+          if (env.AWS_CREDENTIALS_ID?.trim()) {
+            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: env.AWS_CREDENTIALS_ID]]) {
+              pushToEcr()
             }
+          } else {
+            pushToEcr() // instance role
+          }
         }
+      }
     }
-  
-    
-       stage('docker stop container') {
-            sh 'docker ps -f name=myContainer -q | xargs --no-run-if-empty docker container stop'
-            sh 'docker container ls -a -fname=myContainer -q | xargs -r docker container rm'
+  }
 
-       }
-
-    stage ('Docker run') {
-
-        image.run("-p 8085:8085 --rm --name myContainer")
-
+  post {
+    always {
+      sh 'docker logout ${REGISTRY} || true'
+      cleanWs()
     }
+  }
 }
