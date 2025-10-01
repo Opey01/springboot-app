@@ -1,48 +1,96 @@
 pipeline {
   agent any
   environment {
-    AWS_REGION   = 'us-east-2'
-    ECR_REGISTRY = '850924742604.dkr.ecr.us-east-2.amazonaws.com'
-    ECR_REPO     = "${ECR_REGISTRY}/springboot-app"
+    ACCT_ID        = '850924742604'                  // <-- set your AWS account ID
+    AWS_REGION     = 'us-east-2'                     // repo’s region
+    REPO_PATH      = 'opey01/springboot-app'         // ECR repo MUST be lowercase
+    REGISTRY_HOST  = "${ACCT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    IMAGE_URI      = "${REGISTRY_HOST}/${REPO_PATH}"
   }
 
   stages {
     stage('Checkout') {
       steps {
-        // Use the correct repo/branch; change 'main' to your actual default branch
-        git branch: 'main', url: 'https://github.com/Opey01/springboot-app.git'
+        git 'https://github.com/Opey01/springboot'
       }
     }
 
-    stage('Build') {
-      steps {
-        sh 'mvn -B -f MyAwesomeApp/pom.xml clean package'
-        archiveArtifacts artifacts: 'MyAwesomeApp/target/springbootApp.jar', fingerprint: true
-      }
-    }
-
-    stage('Docker Build') {
+    stage('Prepare Tag') {
       steps {
         script {
-          env.IMAGE_TAG = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-          docker.build("${env.ECR_REPO}:${env.IMAGE_TAG}")
+          // Build a unique, immutable tag (e.g., a1b2c3d-42)
+          def commit = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+          env.BUILD_TAG_IMMUTABLE = "${commit}-${env.BUILD_NUMBER}"
+          echo "Using image tag: ${env.BUILD_TAG_IMMUTABLE}"
         }
       }
     }
 
-    stage('Login & Push to ECR') {
+    stage('Build JAR') {
       steps {
-        sh """
-          aws ecr get-login-password --region ${AWS_REGION} \
-            | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-          docker push ${ECR_REPO}:${IMAGE_TAG}
-        """
+        sh 'mvn clean install'
+      }
+    }
+
+    stage('Build Image') {
+      steps {
+        script {
+          // Build directly with the immutable tag
+          def dockerImage = docker.build("${IMAGE_URI}:${env.BUILD_TAG_IMMUTABLE}")
+        }
+      }
+    }
+
+    stage('Trivy Security Scan') {
+      steps {
+        // Fail on CRITICAL only (adjust as you prefer)
+        sh '''
+          trivy image \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            ${IMAGE_URI}:${BUILD_TAG_IMMUTABLE}
+        '''
+      }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        script {
+          sh """
+            # Login to ECR
+            aws ecr get-login-password --region ${AWS_REGION} \
+              | docker login --username AWS --password-stdin ${REGISTRY_HOST}
+
+            # Ensure repo exists (no-op if it already exists)
+            aws ecr describe-repositories --repository-names ${REPO_PATH} --region ${AWS_REGION} >/dev/null 2>&1 \
+              || aws ecr create-repository --repository-name ${REPO_PATH} --region ${AWS_REGION} \
+                   --image-scanning-configuration scanOnPush=true
+
+            # Push immutable tag only (no :latest)
+            docker push ${IMAGE_URI}:${BUILD_TAG_IMMUTABLE}
+          """
+        }
+      }
+    }
+
+    stage('Deploy by Tag') {
+      steps {
+        script {
+          // Stop & remove existing container if present
+          sh '''
+            docker ps -f name=springbootApp -q | xargs -r docker stop
+            docker container ls -a -f name=springbootApp -q | xargs -r docker rm
+          '''
+
+          // Run the just-pushed immutable image
+          sh """
+            docker run -d --rm --name springbootApp \
+              -p 8096:8080 \
+              ${IMAGE_URI}:${BUILD_TAG_IMMUTABLE}
+          """
+        }
       }
     }
   }
-
-  post {
-    always { cleanWs() }
-  }
 }
-
