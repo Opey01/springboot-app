@@ -1,72 +1,63 @@
 pipeline {
   agent any
-  options { skipDefaultCheckout(true) }   // avoid accidental checkout of other repos
+  options { timestamps(); ansiColor('xterm') }
+
   environment {
-    AWS_REGION      = 'us-east-2'
-    ACCOUNT_ID      = '850924742604'
-    ECR_REGISTRY    = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-    ECR_REPO_NAME   = 'mydockerrepo'                      // <-- your repo name
-    ECR_REPO        = "${ECR_REGISTRY}/${ECR_REPO_NAME}"
-    IMAGE_TAG       = ''                                   // set in Prepare Tag
-    DOCKERFILE_PATH = 'Dockerfile'                         // change if yours is elsewhere
-    BUILD_CONTEXT   = '.'                                  // change if needed
-    DOCKER_BUILDKIT = '1'
+    // === GIT ===
+    GIT_URL       = 'https://github.com/Opey01/springboot-app.git' // default branch used
+
+    // === AWS / ECR ===
+    AWS_REGION    = 'us-east-2'
+    ACCOUNT_ID    = '850924742604'
+    ECR_REPO_NAME = 'mydockerrepo'
+    REGISTRY      = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+    // === Build paths (adjust if needed) ===
+    POM_PATH        = 'MyAwesomeApp/pom.xml'
+    DOCKERFILE_PATH = 'Dockerfile'   // or 'MyAwesomeApp/Dockerfile'
+    BUILD_CONTEXT   = '.'            // or 'MyAwesomeApp'
   }
 
   stages {
     stage('Checkout') {
       steps {
-        // Pull the same repo that contains this Jenkinsfile
-        checkout scm
-        // If you want to pin explicitly:
-        // git url: 'https://github.com/Opey01/springboot-app.git', branch: 'main'
-      }
-    }
-
-    stage('Build JAR') {
-      steps {
-        // adjust path if your pom.xml lives elsewhere
-        sh 'mvn -B -f MyAwesomeApp/pom.xml clean package'
-        archiveArtifacts artifacts: 'MyAwesomeApp/target/springbootApp.jar', fingerprint: true
+        deleteDir()
+        git url: env.GIT_URL
       }
     }
 
     stage('Prepare Tag') {
       steps {
         script {
-          env.IMAGE_TAG = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+          def sha = sh(returnStdout: true, script: 'git rev-parse --short=12 HEAD').trim()
+          env.IMAGE_TAG = "${sha}-${BUILD_NUMBER}"                   // immutable
+          env.IMAGE_URI = "${REGISTRY}/${ECR_REPO_NAME}:${IMAGE_TAG}"
+          echo "IMAGE_URI = ${env.IMAGE_URI}"
         }
-        echo "Will push: ${ECR_REPO}:${IMAGE_TAG}"
       }
     }
 
-    stage('Ensure ECR Repo') {
+    stage('Build JAR') {
       steps {
-        sh '''
-          aws ecr describe-repositories --repository-names ${ECR_REPO_NAME} --region ${AWS_REGION} >/dev/null 2>&1 \
-          || aws ecr create-repository --repository-name ${ECR_REPO_NAME} --region ${AWS_REGION}
-        '''
+        sh 'mvn -f "$POM_PATH" -B clean install'
       }
     }
 
     stage('Docker Build') {
       steps {
-        sh 'docker build -f ${DOCKERFILE_PATH} -t ${ECR_REPO}:${IMAGE_TAG} ${BUILD_CONTEXT}'
+        sh 'docker build -t "$IMAGE_URI" -f "$DOCKERFILE_PATH" "$BUILD_CONTEXT"'
       }
     }
 
     stage('Trivy Security Scan') {
       steps {
         sh '''
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v $HOME/.cache:/root/.cache \
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image \
-            --severity HIGH,CRITICAL,MEDIUM \
-            --ignore-unfixed \
+            --severity HIGH,CRITICAL \
             --no-progress \
             --exit-code 1 \
-            ${ECR_REPO}:${IMAGE_TAG}
+            "$IMAGE_URI"
         '''
       }
     }
@@ -74,17 +65,21 @@ pipeline {
     stage('Login & Push to ECR') {
       steps {
         sh '''
-          aws ecr get-login-password --region ${AWS_REGION} \
-            | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-          docker push ${ECR_REPO}:${IMAGE_TAG}
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+
+          docker push "$IMAGE_URI"
         '''
       }
     }
   }
 
   post {
-    success { echo "Pushed image: ${ECR_REPO}:${IMAGE_TAG}" }
-    always  { cleanWs() }
+    always {
+      sh 'docker logout "$REGISTRY" || true'
+      archiveArtifacts artifacts: 'MyAwesomeApp/target/*.jar', fingerprint: true, onlyIfSuccessful: false
+    }
   }
 }
+
 
