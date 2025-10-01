@@ -1,6 +1,10 @@
 pipeline {
   agent any
-  options { timestamps(); skipDefaultCheckout(true) }
+  options {
+    timestamps()
+    skipDefaultCheckout(true)
+    buildDiscarder(logRotator(numToKeepStr: '10'))  // keep last 10 builds
+  }
 
   environment {
     AWS_REGION = 'us-east-2'
@@ -10,16 +14,28 @@ pipeline {
     REPO_URL   = 'https://github.com/Opey01/springboot-app.git'
     BRANCH     = 'main'
     DOCKERFILE = 'Dockerfilejenkins'
+    TRIVY_CACHE_DIR = "${WORKSPACE}/.trivycache"    // cache inside workspace
   }
 
   stages {
     stage('Prep (clean workspace)') { steps { deleteDir() } }
 
+    stage('Pre-clean Docker (safe)') {
+      steps {
+        sh '''
+          docker builder prune -af || true
+          docker container prune -f || true
+          docker image prune -af || true
+          docker volume prune -f || true
+        '''
+      }
+    }
+
     stage('Checkout') {
       steps { git url: "${REPO_URL}", branch: "${BRANCH}", changelog: false, poll: false }
     }
 
-    stage('Build (Maven)') {               // <— root pom.xml (no MyAwesomeApp/)
+    stage('Build (Maven)') {
       steps { sh 'mvn -B -DskipTests clean package' }
     }
 
@@ -34,16 +50,25 @@ pipeline {
       }
     }
 
-    // If Trivy isn't installed on the Jenkins node, use the Dockerized scanner below instead of the next stage.
     stage('Trivy Scan') {
       steps {
-        // Option A: native trivy (installed on node)
-        sh 'trivy image --exit-code 1 --severity CRITICAL,HIGH ${ECR_URL}:${IMAGE_TAG} || true'
-        // Remove "|| true" to hard-fail on findings
+        sh '''
+          mkdir -p "${TRIVY_CACHE_DIR}"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${TRIVY_CACHE_DIR}:/root/.cache/trivy" \
+            aquasec/trivy:latest image \
+            --scanners vuln \
+            --severity CRITICAL,HIGH \
+            --exit-code 1 \
+            --no-progress \
+            ${ECR_URL}:${IMAGE_TAG}
+        '''
       }
     }
 
     stage('ECR Login & Push') {
+      when { expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') } }
       steps {
         sh '''
           aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION} >/dev/null 2>&1 || \
@@ -65,6 +90,7 @@ pipeline {
     }
   }
 }
+
 
 
 
