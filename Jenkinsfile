@@ -14,7 +14,7 @@ pipeline {
     DOCKERFILE_PATH = 'Dockerfilejenkins'
     BUILD_CONTEXT   = '.'
 
-    AWS_CREDENTIALS_ID = ''   // set a Jenkins AWS creds ID here only if NOT using instance role
+    AWS_CREDENTIALS_ID = ''   // if you use an instance role, leave blank
   }
 
   stages {
@@ -22,7 +22,6 @@ pipeline {
 
     stage('Checkout') {
       steps {
-        // Explicitly use your GitHub repo + main branch
         git url: 'https://github.com/Opey01/springboot-app.git', branch: 'main'
       }
     }
@@ -80,7 +79,7 @@ pipeline {
               pushToEcr()
             }
           } else {
-            pushToEcr() // instance role
+            pushToEcr() // uses instance role
           }
         }
       }
