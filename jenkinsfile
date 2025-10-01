@@ -2,7 +2,7 @@ pipeline {
   agent any
   options {
     timestamps()
-    skipDefaultCheckout(true)
+    skipDefaultCheckout(true)   // stop Jenkins from auto-checkout
   }
 
   environment {
@@ -16,21 +16,26 @@ pipeline {
 
     // --- Build inputs ---
     POM_PATH        = 'MyAwesomeApp/pom.xml'
-    DOCKERFILE_PATH = 'Dockerfile'   // new Dockerfile at repo root
-    BUILD_CONTEXT   = '.'            // build from repo root
+    DOCKERFILE_PATH = 'Dockerfilejenkins'  // <- your new name
+    BUILD_CONTEXT   = '.'                  // build from repo root
 
-    // If your Jenkins node uses an instance profile/role, leave blank.
-    // If not, set this to your Jenkins AWS credentials ID.
+    // If your agent has an instance role, leave blank.
+    // Otherwise put your Jenkins AWS creds ID here.
     AWS_CREDENTIALS_ID = ''
   }
 
   stages {
+    stage('Prep (clean workspace)') {
+      steps {
+        deleteDir()
+      }
+    }
 
     stage('Checkout') {
       steps {
-        // Force GitHub (prevents old Bitbucket job config from being used)
-        // Change 'main' to 'master' if your default branch is master.
-        git url: 'https://github.com/Opey01/springboot-app.git', branch: 'main'
+        // Use GitHub explicitly so we never hit the old Bitbucket remote
+        // Change 'master' to 'main' if your default branch is main
+        git url: 'https://github.com/Opey01/springboot-app.git', branch: 'master'
       }
     }
 
@@ -58,7 +63,7 @@ pipeline {
 
     stage('Trivy Scan') {
       steps {
-        // Image vulnerability scan; fails build on HIGH/CRITICAL
+        // Fail the build if HIGH/CRITICAL vulns are found
         sh '''
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
@@ -75,7 +80,7 @@ pipeline {
     stage('ECR Login & Push') {
       steps {
         script {
-          def doPush = {
+          def pushToEcr = {
             sh '''
               aws ecr get-login-password --region "$AWS_REGION" \
                 | docker login --username AWS --password-stdin "$REGISTRY"
@@ -87,11 +92,11 @@ pipeline {
           if (env.AWS_CREDENTIALS_ID?.trim()) {
             withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
                               credentialsId: env.AWS_CREDENTIALS_ID]]) {
-              doPush()
+              pushToEcr()
             }
           } else {
-            // Instance profile / role on the agent
-            doPush()
+            // Using instance profile/role on the agent
+            pushToEcr()
           }
         }
       }
