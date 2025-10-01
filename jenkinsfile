@@ -1,8 +1,12 @@
 pipeline {
   agent any
-  options { timestamps(); skipDefaultCheckout(true) }
+  options {
+    timestamps()
+    skipDefaultCheckout(true)
+  }
 
   environment {
+    // --- AWS / ECR ---
     AWS_REGION   = 'us-east-2'
     ACCOUNT_ID   = '850924742604'
     ECR_REPO     = 'mydockerrepo'
@@ -10,21 +14,22 @@ pipeline {
     IMAGE_TAG    = "build-${BUILD_NUMBER}"
     IMAGE_URI    = "${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
 
-    // ← keep your existing POM here
-    POM_PATH         = 'MyAwesomeApp/pom.xml'
+    // --- Build inputs ---
+    POM_PATH        = 'MyAwesomeApp/pom.xml'
+    DOCKERFILE_PATH = 'Dockerfile'   // new Dockerfile at repo root
+    BUILD_CONTEXT   = '.'            // build from repo root
 
-    // Adjust these two depending on where your Dockerfile lives (see notes below)
-    DOCKERFILE_PATH  = 'Dockerfile'
-    BUILD_CONTEXT    = '.'
-
-    // If your agent uses an IAM role for ECR, leave empty. Otherwise put your Jenkins AWS creds ID here.
+    // If your Jenkins node uses an instance profile/role, leave blank.
+    // If not, set this to your Jenkins AWS credentials ID.
     AWS_CREDENTIALS_ID = ''
   }
 
   stages {
+
     stage('Checkout') {
       steps {
-        // Force GitHub (this prevents Jenkins from using an old Bitbucket SCM config)
+        // Force GitHub (prevents old Bitbucket job config from being used)
+        // Change 'main' to 'master' if your default branch is master.
         git url: 'https://github.com/Opey01/springboot-app.git', branch: 'main'
       }
     }
@@ -41,17 +46,19 @@ pipeline {
       }
     }
 
-    stage('Docker Build') {
+    stage('Docker Build & Tag') {
       steps {
         sh '''
           docker build -f ${DOCKERFILE_PATH} -t ${ECR_REPO}:${IMAGE_TAG} ${BUILD_CONTEXT}
           docker tag ${ECR_REPO}:${IMAGE_TAG} ${IMAGE_URI}
+          docker tag ${ECR_REPO}:${IMAGE_TAG} ${REGISTRY}/${ECR_REPO}:latest
         '''
       }
     }
 
     stage('Trivy Scan') {
       steps {
+        // Image vulnerability scan; fails build on HIGH/CRITICAL
         sh '''
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
@@ -68,21 +75,24 @@ pipeline {
     stage('ECR Login & Push') {
       steps {
         script {
-          def loginAndPush = {
+          def doPush = {
             sh '''
               aws ecr get-login-password --region "$AWS_REGION" \
                 | docker login --username AWS --password-stdin "$REGISTRY"
 
-              docker push "$IMAGE_URI"
-
-              docker tag "${ECR_REPO}:${IMAGE_TAG}" "${REGISTRY}/${ECR_REPO}:latest"
+              docker push "${IMAGE_URI}"
               docker push "${REGISTRY}/${ECR_REPO}:latest"
             '''
           }
           if (env.AWS_CREDENTIALS_ID?.trim()) {
             withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                              credentialsId: env.AWS_CREDENTIALS_ID]]) { loginAndPush() }
-          } else { loginAndPush() }
+                              credentialsId: env.AWS_CREDENTIALS_ID]]) {
+              doPush()
+            }
+          } else {
+            // Instance profile / role on the agent
+            doPush()
+          }
         }
       }
     }
@@ -95,6 +105,7 @@ pipeline {
     }
   }
 }
+
 
 
 
