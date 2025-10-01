@@ -1,15 +1,16 @@
-# Dockerfilejenkins (replace the whole file)
+# Dockerfilejenkins
 FROM amazoncorretto:8-alpine-jre
 
-# Run as non-root
+# run as non-root
 RUN addgroup -S app && adduser -S app -G app
 WORKDIR /app
 USER app
 
-# Copy the Spring Boot fat jar built by Maven (root/target/*.jar)
+# JAR comes from root/target after Maven build
 COPY target/*.jar app.jar
 
 EXPOSE 8080
 ENV JAVA_OPTS=""
 ENTRYPOINT ["sh","-c","java $JAVA_OPTS -jar /app/app.jar"]
+
 
