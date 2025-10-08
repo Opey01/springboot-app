@@ -2,7 +2,7 @@ pipeline {
   agent any
   options {
     timestamps()
-    skipDefaultCheckout(true)   // don’t auto-checkout; we control it
+    skipDefaultCheckout(true)   // stop Jenkins from auto-checkout
   }
 
   environment {
@@ -19,11 +19,12 @@ pipeline {
     DOCKERFILE_PATH = 'Dockerfilejenkins'
     BUILD_CONTEXT   = '.'
 
-    // If your Jenkins node has IAM role, leave blank
+    // AWS credentials (leave blank if EC2 has IAM role)
     AWS_CREDENTIALS_ID = ''
   }
 
   stages {
+
     stage('Prep (Clean Workspace)') {
       steps {
         deleteDir()
@@ -102,7 +103,13 @@ pipeline {
         script {
           withKubeConfig([credentialsId: 'K8S']) {
             sh '''
+              echo "=== Verifying cluster connectivity ==="
+              kubectl get nodes
+
+              echo "=== Applying deployment YAML ==="
               envsubst < eks-deploy-k8s.yaml | kubectl apply -f -
+
+              echo "=== Waiting for rollout ==="
               kubectl rollout status deployment/springboot-app-deployment
             '''
           }
@@ -117,8 +124,18 @@ pipeline {
             sh '''
               echo "=== Pods ==="
               kubectl get pods -o wide
+
               echo "=== Services ==="
               kubectl get svc springboot-service -o wide
+
+              echo "=== Checking LoadBalancer Access ==="
+              LB=$(kubectl get svc springboot-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+              if [ -n "$LB" ]; then
+                echo "LoadBalancer DNS: http://$LB"
+                curl -I http://$LB || true
+              else
+                echo "LoadBalancer not provisioned yet."
+              fi
             '''
           }
         }
