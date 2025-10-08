@@ -98,37 +98,30 @@ pipeline {
       }
     }
 
-    stage('Deploy to EKS') {
-      steps {
-        script {
-         withKubeConfig([credentialsId: 'K8S']) {
-  sh '''
-    envsubst < eks-deploy-k8s.yaml | kubectl apply -f -
-    kubectl rollout status deployment/springboot-app-deployment
-  '''
-}
-        }
-      }
-    }
-
-    stage('Verify Deployment') {
+    stage('Deploy to EKS with Helm') {
       steps {
         script {
           withKubeConfig([credentialsId: 'K8S']) {
+            sh """
+              helm upgrade --install springboot /home/ubuntu/springboot-chart \
+                --set image.repository=${REGISTRY}/${ECR_REPO} \
+                --set image.tag=build-${BUILD_NUMBER} \
+                --namespace default
+            """
+
+            // Wait for rollout
+            sh 'kubectl rollout status deployment/springboot-springboot-chart'
+
+            // Show service and external URL
             sh '''
-              echo "=== Pods ==="
-              kubectl get pods -o wide
-
               echo "=== Services ==="
-              kubectl get svc springboot-service -o wide
+              kubectl get svc springboot-springboot-chart -o wide
 
-              echo "=== Checking LoadBalancer Access ==="
-              LB=$(kubectl get svc springboot-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+              LB=$(kubectl get svc springboot-springboot-chart -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
               if [ -n "$LB" ]; then
-                echo "LoadBalancer DNS: http://$LB"
-                curl -I http://$LB || true
+                echo "Application available at: http://$LB"
               else
-                echo "LoadBalancer not provisioned yet."
+                echo "LoadBalancer is still provisioning..."
               fi
             '''
           }
