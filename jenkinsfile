@@ -101,18 +101,12 @@ pipeline {
     stage('Deploy to EKS') {
       steps {
         script {
-          withKubeConfig([credentialsId: 'K8S']) {
-            sh '''
-              echo "=== Verifying cluster connectivity ==="
-              kubectl get nodes
-
-              echo "=== Applying deployment YAML ==="
-              envsubst < eks-deploy-k8s.yaml | kubectl apply -f -
-
-              echo "=== Waiting for rollout ==="
-              kubectl rollout status deployment/springboot-app-deployment
-            '''
-          }
+         withKubeConfig([credentialsId: 'K8S']) {
+  sh '''
+    envsubst < eks-deploy-k8s.yaml | kubectl apply -f -
+    kubectl rollout status deployment/springboot-app-deployment
+  '''
+}
         }
       }
     }
