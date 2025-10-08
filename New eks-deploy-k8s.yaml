@@ -5,7 +5,7 @@ metadata:
   labels:
     app: springboot-app
 spec:
-  replicas: 3   # ✅ scalable, you can adjust to 2/4
+  replicas: 3
   selector:
     matchLabels:
       app: springboot-app
@@ -16,11 +16,10 @@ spec:
     spec:
       containers:
       - name: springboot-app
-        # ✅ Use Jenkins dynamic build tag
         image: 850924742604.dkr.ecr.us-east-2.amazonaws.com/mydockerrepo:build-${BUILD_NUMBER}
         imagePullPolicy: Always
         ports:
-        - containerPort: 8080
+        - containerPort: 8085   # ✅ internal app port
           name: http
           protocol: TCP
 ---
@@ -31,11 +30,12 @@ metadata:
   labels:
     app: springboot-app
 spec:
-  type: LoadBalancer   # ✅ external access
+  type: LoadBalancer   # ✅ exposes app via AWS ELB
   selector:
     app: springboot-app
   ports:
     - name: http
-      port: 80          # public-facing port
-      targetPort: 8080  # forward to container
+      port: 80          # ✅ external-facing port (browser uses this)
+      targetPort: 8085  # ✅ forward traffic to container port
       protocol: TCP
+
