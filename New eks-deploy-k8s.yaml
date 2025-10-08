@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: springboot-app-deployment
+  labels:
+    app: springboot-app
+spec:
+  replicas: 3   # ✅ scalable, you can adjust to 2/4
+  selector:
+    matchLabels:
+      app: springboot-app
+  template:
+    metadata:
+      labels:
+        app: springboot-app
+    spec:
+      containers:
+      - name: springboot-app
+        # ✅ Use Jenkins dynamic build tag
+        image: 850924742604.dkr.ecr.us-east-2.amazonaws.com/mydockerrepo:build-${BUILD_NUMBER}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: springboot-service
+  labels:
+    app: springboot-app
+spec:
+  type: LoadBalancer   # ✅ external access
+  selector:
+    app: springboot-app
+  ports:
+    - name: http
+      port: 80          # public-facing port
+      targetPort: 8080  # forward to container
+      protocol: TCP
