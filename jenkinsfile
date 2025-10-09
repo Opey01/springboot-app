@@ -1,139 +1,52 @@
 pipeline {
   agent any
-  options {
-    timestamps()
-    skipDefaultCheckout(true)   // stop Jenkins from auto-checkout
-  }
+  tools { maven 'Maven3' }
 
   environment {
-    // --- AWS / ECR ---
-    AWS_REGION   = 'us-east-2'
-    ACCOUNT_ID   = '850924742604'
-    ECR_REPO     = 'mydockerrepo'
-    REGISTRY     = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-    IMAGE_TAG    = "build-${BUILD_NUMBER}"
-    IMAGE_URI    = "${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
-
-    // --- Build inputs ---
-    POM_PATH        = 'MyAwesomeApp/pom.xml'
-    DOCKERFILE_PATH = 'Dockerfilejenkins'
-    BUILD_CONTEXT   = '.'
-
-    // AWS credentials (leave blank if EC2 has IAM role)
-    AWS_CREDENTIALS_ID = ''
+    AWS_REGION = "us-east-2"
+    ACCOUNT_ID = "850924742604"
+    ECR_REPO   = "mydockerrepo"
+    REGISTRY   = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
   }
 
   stages {
-
-    stage('Prep (Clean Workspace)') {
+    stage('Checkout') {
       steps {
-        deleteDir()
+        git url: 'https://github.com/Opey01/springboot-app.git', branch: 'main'
       }
     }
 
-    stage('Checkout Source') {
+    stage('Build JAR') {
       steps {
-        git url: 'https://github.com/Opey01/springboot-app.git', branch: 'master'
+        sh 'mvn -B -DskipTests clean package'
       }
     }
 
-    stage('Build with Maven') {
+    stage('Build & Push Image') {
       steps {
-        sh 'mvn -f ${POM_PATH} -B -DskipTests clean package'
-      }
-    }
-
-    stage('Archive JAR Artifact') {
-      steps {
-        archiveArtifacts artifacts: 'MyAwesomeApp/target/*.jar', fingerprint: true
-      }
-    }
-
-    stage('Docker Build & Tag') {
-      steps {
+        script {
+          env.SHA = sh(returnStdout: true, script: "git rev-parse --short=8 HEAD").trim()
+          env.TAG = "sha-${SHA}"
+          env.IMAGE_URI = "${REGISTRY}/${ECR_REPO}:${TAG}"
+        }
         sh '''
-          docker build -f ${DOCKERFILE_PATH} -t ${ECR_REPO}:${IMAGE_TAG} ${BUILD_CONTEXT}
-          docker tag ${ECR_REPO}:${IMAGE_TAG} ${IMAGE_URI}
-          docker tag ${ECR_REPO}:${IMAGE_TAG} ${REGISTRY}/${ECR_REPO}:latest
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
+          docker build -f Dockerfilejenkins -t $IMAGE_URI .
+          docker push $IMAGE_URI
         '''
       }
     }
 
-    stage('Trivy Scan (Security)') {
+    stage('Helm Deploy to EKS') {
       steps {
         sh '''
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v $WORKSPACE/.trivy-cache:/root/.cache/ \
-            aquasec/trivy:latest image \
-            --severity HIGH,CRITICAL \
-            --no-progress \
-            --exit-code 1 \
-            ${IMAGE_URI}
+          helm upgrade --install springboot ./springboot-chart \
+            --namespace default \
+            --set image.repository=$REGISTRY/$ECR_REPO \
+            --set image.tag=$TAG \
+            --atomic --timeout 5m
         '''
       }
-    }
-
-    stage('Push to ECR') {
-      steps {
-        script {
-          def pushToEcr = {
-            sh '''
-              aws ecr get-login-password --region "$AWS_REGION" \
-                | docker login --username AWS --password-stdin "$REGISTRY"
-
-              docker push "${IMAGE_URI}"
-              docker push "${REGISTRY}/${ECR_REPO}:latest"
-            '''
-          }
-          if (env.AWS_CREDENTIALS_ID?.trim()) {
-            withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
-                              credentialsId: env.AWS_CREDENTIALS_ID]]) {
-              pushToEcr()
-            }
-          } else {
-            pushToEcr()
-          }
-        }
-      }
-    }
-
-    stage('Deploy to EKS with Helm') {
-      steps {
-        script {
-          withKubeConfig([credentialsId: 'K8S']) {
-            sh """
-              helm upgrade --install springboot /home/ubuntu/springboot-chart \
-                --set image.repository=${REGISTRY}/${ECR_REPO} \
-                --set image.tag=build-${BUILD_NUMBER} \
-                --namespace default
-            """
-
-            // Wait for rollout
-            sh 'kubectl rollout status deployment/springboot-springboot-chart'
-
-            // Show service and external URL
-            sh '''
-              echo "=== Services ==="
-              kubectl get svc springboot-springboot-chart -o wide
-
-              LB=$(kubectl get svc springboot-springboot-chart -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-              if [ -n "$LB" ]; then
-                echo "Application available at: http://$LB"
-              else
-                echo "LoadBalancer is still provisioning..."
-              fi
-            '''
-          }
-        }
-      }
-    }
-  }
-
-  post {
-    always {
-      sh 'docker logout ${REGISTRY} || true'
-      cleanWs()
     }
   }
 }
