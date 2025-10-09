@@ -40,17 +40,17 @@ pipeline {
     stage('Helm Deploy to EKS') {
       steps {
         sh '''
-          helm upgrade --install springboot ./springboot-chart \
-            --namespace default \
+          helm upgrade --install springboot ~/mychart \
+            --namespace helm-deployment \
             --set image.repository=$REGISTRY/$ECR_REPO \
             --set image.tag=$TAG \
+            --set containerPort=8085 \
             --atomic --timeout 5m
         '''
       }
     }
   }
 }
-
 
 
 
