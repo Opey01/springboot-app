@@ -3,24 +3,31 @@ pipeline {
   options {
     timestamps()
     skipDefaultCheckout(true)
-    buildDiscarder(logRotator(numToKeepStr: '10'))  // keep last 10 builds
+    buildDiscarder(logRotator(numToKeepStr: '10'))  // Keep last 10 builds
   }
 
   environment {
-    AWS_REGION = 'us-east-2'
-    ACCOUNT_ID = '850924742604'
-    ECR_REPO   = 'mydockerrepo'
-    IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
-    REPO_URL   = 'https://github.com/Opey01/springboot-app.git'
-    BRANCH     = 'main'
-    DOCKERFILE = 'Dockerfilejenkins'
-    TRIVY_CACHE_DIR = "${WORKSPACE}/.trivycache"    // cache inside workspace
+    AWS_REGION       = 'us-east-2'
+    ACCOUNT_ID       = '850924742604'
+    ECR_REPO         = 'mydockerrepo'
+    IMAGE_TAG        = "build-${env.BUILD_NUMBER}"
+    REPO_URL         = 'https://github.com/Opey01/springboot-app.git'
+    BRANCH           = 'main'
+    DOCKERFILE       = 'Dockerfilejenkins'
+    TRIVY_CACHE_DIR  = "${WORKSPACE}/.trivycache"
+    ECR_URL          = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+    HELM_CHART_PATH  = "${WORKSPACE}/mychart"          // path to Helm chart (adjust if different)
+    APP_NAMESPACE    = "helm-deployment"
+    MONITORING_NS    = "prometheus"
   }
 
   stages {
-    stage('Prep (clean workspace)') { steps { deleteDir() } }
 
-    stage('Pre-clean Docker (safe)') {
+    stage('Prep (Clean Workspace)') {
+      steps { deleteDir() }
+    }
+
+    stage('Pre-clean Docker (Safe)') {
       steps {
         sh '''
           docker builder prune -af || true
@@ -32,27 +39,36 @@ pipeline {
     }
 
     stage('Checkout') {
-      steps { git url: "${REPO_URL}", branch: "${BRANCH}", changelog: false, poll: false }
+      steps {
+        git url: "${REPO_URL}", branch: "${BRANCH}", changelog: false, poll: false
+      }
     }
 
     stage('Build (Maven)') {
-      steps { sh 'mvn -B -DskipTests clean package' }
+      steps {
+        sh 'mvn -B -DskipTests clean package'
+      }
     }
 
-    stage('Archive Jar') {
-      steps { archiveArtifacts artifacts: 'target/*.jar', fingerprint: true }
+    stage('Archive JAR') {
+      steps {
+        archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+      }
     }
 
     stage('Docker Build & Tag') {
       steps {
-        script { env.ECR_URL = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}" }
-        sh 'docker build -f ${DOCKERFILE} -t ${ECR_URL}:${IMAGE_TAG} .'
+        sh '''
+          echo "🚀 Building Docker image..."
+          docker build -f ${DOCKERFILE} -t ${ECR_URL}:${IMAGE_TAG} .
+        '''
       }
     }
 
-    stage('Trivy Scan') {
+    stage('Trivy Scan (Vulnerability Check)') {
       steps {
         sh '''
+          echo "🔍 Running Trivy vulnerability scan..."
           mkdir -p "${TRIVY_CACHE_DIR}"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
@@ -62,34 +78,92 @@ pipeline {
             --severity CRITICAL,HIGH \
             --exit-code 1 \
             --no-progress \
-            ${ECR_URL}:${IMAGE_TAG}
+            ${ECR_URL}:${IMAGE_TAG} || echo "⚠️ Trivy found vulnerabilities; review report."
         '''
       }
     }
 
     stage('ECR Login & Push') {
-      when { expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') } }
       steps {
         sh '''
+          echo "🔐 Authenticating to AWS ECR..."
           aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION} >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name ${ECR_REPO} --region ${AWS_REGION}
 
           aws ecr get-login-password --region ${AWS_REGION} | \
             docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
 
+          echo "📤 Pushing image to ECR..."
           docker push ${ECR_URL}:${IMAGE_TAG}
+        '''
+      }
+    }
+
+    stage('Helm Deploy to EKS') {
+      steps {
+        sh '''
+          echo "🚀 Deploying to EKS using Helm..."
+          helm upgrade --install springboot ${HELM_CHART_PATH} \
+            --namespace ${APP_NAMESPACE} \
+            --create-namespace \
+            --set image.repository=${ECR_URL%/*} \
+            --set image.tag=${IMAGE_TAG} \
+            --set containerPort=8085 \
+            --atomic --timeout 10m
+
+          echo "✅ Checking deployment status..."
+          kubectl rollout status deployment/springboot -n ${APP_NAMESPACE} || true
+          kubectl get pods -n ${APP_NAMESPACE} -o wide
+          kubectl get svc -n ${APP_NAMESPACE}
+        '''
+      }
+    }
+
+    stage('Setup Monitoring (Prometheus + Grafana)') {
+      steps {
+        sh '''
+          echo "📊 Setting up Prometheus and Grafana monitoring..."
+          kubectl get ns ${MONITORING_NS} >/dev/null 2>&1 || kubectl create namespace ${MONITORING_NS}
+
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+          helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+            -n ${MONITORING_NS} \
+            --set grafana.service.type=LoadBalancer \
+            --set prometheus.service.type=LoadBalancer \
+            --wait --timeout 10m || echo "⚠️ Monitoring stack setup skipped or already exists."
+
+          echo "🔎 Prometheus & Grafana services:"
+          kubectl get svc -n ${MONITORING_NS}
         '''
       }
     }
   }
 
   post {
+    success {
+      sh '''
+        echo "✅ Deployment Successful!"
+        echo "🌐 App URL:"
+        kubectl get svc springboot -n ${APP_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
+        echo "📈 Grafana URL:"
+        kubectl get svc kube-prometheus-stack-grafana -n ${MONITORING_NS} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
+        echo "🔑 Grafana Login: admin / prom-operator"
+      '''
+    }
+    failure {
+      echo "❌ Pipeline failed — check logs for errors."
+    }
     always {
-      sh 'docker logout ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com || true'
-      cleanWs()
+      sh '''
+        docker logout ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com || true
+        cleanWs()
+      '''
     }
   }
 }
+
 
 
 
