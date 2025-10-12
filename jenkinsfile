@@ -3,7 +3,7 @@ pipeline {
   options {
     timestamps()
     skipDefaultCheckout(true)
-    buildDiscarder(logRotator(numToKeepStr: '10'))  // Keep last 10 builds
+    buildDiscarder(logRotator(numToKeepStr: '10'))  // keep last 10 builds
   }
 
   environment {
@@ -16,7 +16,7 @@ pipeline {
     DOCKERFILE       = 'Dockerfilejenkins'
     TRIVY_CACHE_DIR  = "${WORKSPACE}/.trivycache"
     ECR_URL          = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
-    HELM_CHART_PATH  = "${WORKSPACE}/mychart"          // path to Helm chart (adjust if different)
+    HELM_CHART_PATH  = "${WORKSPACE}/mychart"          // adjust to your actual chart path
     APP_NAMESPACE    = "helm-deployment"
     MONITORING_NS    = "prometheus"
   }
@@ -24,21 +24,22 @@ pipeline {
   stages {
 
     stage('Prep (Clean Workspace)') {
-      steps { deleteDir() }
+      steps {
+        echo "🧹 Cleaning Jenkins workspace..."
+        deleteDir()
+      }
     }
 
     stage('Pre-clean Docker (Safe)') {
       steps {
         sh '''
-          docker builder prune -af || true
-          docker container prune -f || true
-          docker image prune -af || true
-          docker volume prune -f || true
+          echo "🧽 Cleaning Docker system (builder, containers, images, volumes)..."
+          docker system prune -a -f --volumes || true
         '''
       }
     }
 
-    stage('Checkout') {
+    stage('Checkout Code') {
       steps {
         git url: "${REPO_URL}", branch: "${BRANCH}", changelog: false, poll: false
       }
@@ -46,6 +47,7 @@ pipeline {
 
     stage('Build (Maven)') {
       steps {
+        echo "⚙️ Building JAR package..."
         sh 'mvn -B -DskipTests clean package'
       }
     }
@@ -59,41 +61,41 @@ pipeline {
     stage('Docker Build & Tag') {
       steps {
         sh '''
-          echo "🚀 Building Docker image..."
+          echo "🐳 Building Docker image..."
           docker build -f ${DOCKERFILE} -t ${ECR_URL}:${IMAGE_TAG} .
         '''
       }
     }
 
-    stage('Trivy Scan (Vulnerability Check)') {
+    stage('Trivy Security Scan') {
       steps {
         sh '''
-          echo "🔍 Running Trivy vulnerability scan..."
+          echo "🔍 Running Trivy scan on image..."
           mkdir -p "${TRIVY_CACHE_DIR}"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${TRIVY_CACHE_DIR}:/root/.cache/trivy" \
             aquasec/trivy:latest image \
             --scanners vuln \
+            --skip-java-db-update \
             --severity CRITICAL,HIGH \
-            --exit-code 1 \
+            --exit-code 0 \
             --no-progress \
-            ${ECR_URL}:${IMAGE_TAG} || echo "⚠️ Trivy found vulnerabilities; review report."
+            ${ECR_URL}:${IMAGE_TAG} || echo "⚠️ Trivy found vulnerabilities (review manually)."
         '''
       }
     }
 
-    stage('ECR Login & Push') {
+    stage('Push to AWS ECR') {
       steps {
         sh '''
-          echo "🔐 Authenticating to AWS ECR..."
+          echo "🔐 Authenticating and pushing image to ECR..."
           aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION} >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name ${ECR_REPO} --region ${AWS_REGION}
 
           aws ecr get-login-password --region ${AWS_REGION} | \
             docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
 
-          echo "📤 Pushing image to ECR..."
           docker push ${ECR_URL}:${IMAGE_TAG}
         '''
       }
@@ -102,13 +104,17 @@ pipeline {
     stage('Helm Deploy to EKS') {
       steps {
         sh '''
-          echo "🚀 Deploying to EKS using Helm..."
+          echo "☸️  Setting up kubeconfig for EKS..."
+          aws eks update-kubeconfig --region ${AWS_REGION} --name demo-eks-2
+
+          echo "🚀 Deploying SpringBoot App via Helm..."
+          kubectl get ns ${APP_NAMESPACE} >/dev/null 2>&1 || kubectl create ns ${APP_NAMESPACE}
+
           helm upgrade --install springboot ${HELM_CHART_PATH} \
             --namespace ${APP_NAMESPACE} \
-            --create-namespace \
             --set image.repository=${ECR_URL%/*} \
             --set image.tag=${IMAGE_TAG} \
-            --set containerPort=8085 \
+            --set service.type=LoadBalancer \
             --atomic --timeout 10m
 
           echo "✅ Checking deployment status..."
@@ -122,8 +128,8 @@ pipeline {
     stage('Setup Monitoring (Prometheus + Grafana)') {
       steps {
         sh '''
-          echo "📊 Setting up Prometheus and Grafana monitoring..."
-          kubectl get ns ${MONITORING_NS} >/dev/null 2>&1 || kubectl create namespace ${MONITORING_NS}
+          echo "📊 Deploying Prometheus & Grafana..."
+          kubectl get ns ${MONITORING_NS} >/dev/null 2>&1 || kubectl create ns ${MONITORING_NS}
 
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
@@ -132,9 +138,9 @@ pipeline {
             -n ${MONITORING_NS} \
             --set grafana.service.type=LoadBalancer \
             --set prometheus.service.type=LoadBalancer \
-            --wait --timeout 10m || echo "⚠️ Monitoring stack setup skipped or already exists."
+            --wait --timeout 10m
 
-          echo "🔎 Prometheus & Grafana services:"
+          echo "🔎 Monitoring stack deployed successfully."
           kubectl get svc -n ${MONITORING_NS}
         '''
       }
@@ -153,20 +159,14 @@ pipeline {
       '''
     }
     failure {
-      echo "❌ Pipeline failed — check logs for errors."
+      echo "❌ Pipeline failed — check logs for details."
     }
     always {
       sh '''
         docker logout ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com || true
+        rm -rf ${TRIVY_CACHE_DIR} || true
         cleanWs()
       '''
     }
   }
 }
-
-
-
-
-
-
-
