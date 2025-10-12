@@ -1,95 +1,108 @@
 pipeline {
   agent any
+
   options {
     timestamps()
     skipDefaultCheckout(true)
-    buildDiscarder(logRotator(numToKeepStr: '10'))  // keep last 10 builds
+    buildDiscarder(logRotator(numToKeepStr: '15'))
+  }
+
+  parameters {
+    booleanParam(name: 'SETUP_MONITORING', defaultValue: false, description: 'Install/upgrade Prometheus + Grafana (kube-prometheus-stack) into the cluster')
   }
 
   environment {
-    AWS_REGION       = 'us-east-2'
-    ACCOUNT_ID       = '850924742604'
-    ECR_REPO         = 'mydockerrepo'
-    IMAGE_TAG        = "build-${env.BUILD_NUMBER}"
-    REPO_URL         = 'https://github.com/Opey01/springboot-app.git'
-    BRANCH           = 'main'
-    DOCKERFILE       = 'Dockerfilejenkins'
-    TRIVY_CACHE_DIR  = "${WORKSPACE}/.trivycache"
-    ECR_URL          = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
-    HELM_CHART_PATH  = "${WORKSPACE}/mychart"          // adjust to your actual chart path
-    APP_NAMESPACE    = "helm-deployment"
-    MONITORING_NS    = "prometheus"
+    // --- AWS / ECR ---
+    AWS_REGION      = 'us-east-2'
+    ACCOUNT_ID      = '850924742604'
+    ECR_REPO        = 'mydockerrepo'
+    ECR_URL         = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+    IMAGE_TAG       = "build-${env.BUILD_NUMBER}"
+    DOCKERFILE      = 'Dockerfilejenkins'
+
+    // --- Source ---
+    REPO_URL        = 'https://github.com/Opey01/springboot-app.git'
+    BRANCH          = 'main'
+
+    // --- Kubernetes / Helm ---
+    APP_NAMESPACE   = 'helm-deployment'
+    HELM_CHART_PATH = "${WORKSPACE}/mychart"  // chart directory inside repo/workspace
+    CONTAINER_PORT  = '8085'
+    SERVICE_PORT    = '80'
+
+    // --- Trivy cache (keeps DB so scans are faster and avoid disk churn) ---
+    TRIVY_CACHE_DIR = "${WORKSPACE}/.trivycache"
+
+    // --- Smoke test expectations (strings to assert on the homepage) ---
+    EXPECT_A = 'We are learning Deployment of Java + Docker + SpringBoot + Helm + EKS Cluster!!!!'
+    EXPECT_B = 'Welcome to the SpringBoot Docker container running inside the EKS Cluster!!!!'
   }
 
   stages {
-
     stage('Prep (Clean Workspace)') {
-      steps {
-        echo "🧹 Cleaning Jenkins workspace..."
-        deleteDir()
-      }
+      steps { deleteDir() }
     }
 
-    stage('Pre-clean Docker (Safe)') {
-      steps {
-        sh '''
-          echo "🧽 Cleaning Docker system (builder, containers, images, volumes)..."
-          docker system prune -a -f --volumes || true
-        '''
-      }
-    }
-
-    stage('Checkout Code') {
+    stage('Checkout') {
       steps {
         git url: "${REPO_URL}", branch: "${BRANCH}", changelog: false, poll: false
       }
     }
 
-    stage('Build (Maven)') {
+    stage('Docker Cleanup (Safe)') {
       steps {
-        echo "⚙️ Building JAR package..."
+        sh '''
+          docker builder prune -af || true
+          docker container prune -f || true
+          docker image prune -af || true
+          docker volume prune -f || true
+        '''
+      }
+    }
+
+    stage('Build (Maven)') {
+      tools { maven 'Maven3' }
+      steps {
         sh 'mvn -B -DskipTests clean package'
       }
     }
 
     stage('Archive JAR') {
-      steps {
-        archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
-      }
+      steps { archiveArtifacts artifacts: 'target/*.jar', fingerprint: true }
     }
 
     stage('Docker Build & Tag') {
       steps {
         sh '''
-          echo "🐳 Building Docker image..."
+          echo "🚀 Building Docker image: ${ECR_URL}:${IMAGE_TAG}"
           docker build -f ${DOCKERFILE} -t ${ECR_URL}:${IMAGE_TAG} .
         '''
       }
     }
 
-    stage('Trivy Security Scan') {
+    stage('Trivy Scan (vuln only: HIGH/CRITICAL)') {
       steps {
         sh '''
-          echo "🔍 Running Trivy scan on image..."
+          echo "🔍 Trivy scan on ${ECR_URL}:${IMAGE_TAG}"
           mkdir -p "${TRIVY_CACHE_DIR}"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${TRIVY_CACHE_DIR}:/root/.cache/trivy" \
             aquasec/trivy:latest image \
             --scanners vuln \
-            --skip-java-db-update \
             --severity CRITICAL,HIGH \
             --exit-code 0 \
             --no-progress \
-            ${ECR_URL}:${IMAGE_TAG} || echo "⚠️ Trivy found vulnerabilities (review manually)."
+            --skip-db-update=false \
+            ${ECR_URL}:${IMAGE_TAG}
         '''
       }
     }
 
-    stage('Push to AWS ECR') {
+    stage('ECR Login & Push') {
       steps {
         sh '''
-          echo "🔐 Authenticating and pushing image to ECR..."
+          echo "🔐 Authenticating to AWS ECR and pushing ${ECR_URL}:${IMAGE_TAG}"
           aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION} >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name ${ECR_REPO} --region ${AWS_REGION}
 
@@ -104,44 +117,92 @@ pipeline {
     stage('Helm Deploy to EKS') {
       steps {
         sh '''
-          echo "☸️  Setting up kubeconfig for EKS..."
-          aws eks update-kubeconfig --region ${AWS_REGION} --name demo-eks-2
+          echo "🧭 Ensuring namespace exists: ${APP_NAMESPACE}"
+          kubectl create namespace ${APP_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
-          echo "🚀 Deploying SpringBoot App via Helm..."
-          kubectl get ns ${APP_NAMESPACE} >/dev/null 2>&1 || kubectl create ns ${APP_NAMESPACE}
-
+          echo "🛠️  Deploying with Helm from ${HELM_CHART_PATH}"
           helm upgrade --install springboot ${HELM_CHART_PATH} \
-            --namespace ${APP_NAMESPACE} \
+            --namespace ${APP_NAMESPACE} --create-namespace \
             --set image.repository=${ECR_URL%/*} \
             --set image.tag=${IMAGE_TAG} \
+            --set containerPort=${CONTAINER_PORT} \
             --set service.type=LoadBalancer \
+            --set service.port=${SERVICE_PORT} \
+            --set autoscaling.enabled=false \
+            --set ingress.enabled=false \
+            --set fullnameOverride=springboot \
             --atomic --timeout 10m
 
-          echo "✅ Checking deployment status..."
-          kubectl rollout status deployment/springboot -n ${APP_NAMESPACE} || true
+          echo "⏳ Waiting for rollout..."
+          kubectl rollout status deployment/springboot -n ${APP_NAMESPACE} --timeout=300s
+
+          echo "📦 Pods:"
           kubectl get pods -n ${APP_NAMESPACE} -o wide
-          kubectl get svc -n ${APP_NAMESPACE}
+          echo "🌐 Service:"
+          kubectl get svc springboot -n ${APP_NAMESPACE} -o wide
+        '''
+      }
+    }
+
+    stage('Smoke Test (HTTP + Content Assertions)') {
+      steps {
+        sh '''
+          set -euo pipefail
+          echo "🌐 Resolving Service hostname..."
+          ELB_HOST=$(kubectl get svc springboot -n ${APP_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -z "${ELB_HOST}" ]; then
+            echo "ELB hostname not ready yet"; kubectl get svc springboot -n ${APP_NAMESPACE} -o yaml | sed -n '1,120p'; exit 1
+          fi
+          APP_URL="http://${ELB_HOST}:${SERVICE_PORT}"
+          echo "🔗 App URL: ${APP_URL}"
+
+          # Retry curl until healthy (max ~3m)
+          for i in $(seq 1 36); do
+            echo "Attempt $i: curl ${APP_URL}"
+            HTTP_CODE=$(curl -s -o /tmp/app.html -w '%{http_code}' --max-time 10 "${APP_URL}" || true)
+            if [ "${HTTP_CODE}" = "200" ] || [ "${HTTP_CODE}" = "302" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          echo "HTTP ${HTTP_CODE}"
+          test "${HTTP_CODE}" = "200" -o "${HTTP_CODE}" = "302"
+
+          echo "🧪 Asserting expected page content..."
+          # Allow either the landing page or redirect target to contain our messages
+          # Follow redirect once if needed
+          if ! (grep -F "${EXPECT_A}" /tmp/app.html && grep -F "${EXPECT_B}" /tmp/app.html); then
+            # try fetching root without redirect following issues
+            curl -s "${APP_URL}" -o /tmp/app2.html || true
+            grep -F "${EXPECT_A}" /tmp/app2.html
+            grep -F "${EXPECT_B}" /tmp/app2.html
+          fi
+
+          echo "✅ Smoke test passed."
         '''
       }
     }
 
     stage('Setup Monitoring (Prometheus + Grafana)') {
+      when { expression { params.SETUP_MONITORING } }
       steps {
         sh '''
-          echo "📊 Deploying Prometheus & Grafana..."
-          kubectl get ns ${MONITORING_NS} >/dev/null 2>&1 || kubectl create ns ${MONITORING_NS}
+          echo "📊 Installing/Upgrading kube-prometheus-stack (Grafana+Prometheus)..."
+          MON_NS=prometheus
+          kubectl get ns ${MON_NS} >/dev/null 2>&1 || kubectl create namespace ${MON_NS}
 
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
 
           helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
-            -n ${MONITORING_NS} \
+            -n ${MON_NS} \
             --set grafana.service.type=LoadBalancer \
             --set prometheus.service.type=LoadBalancer \
-            --wait --timeout 10m
+            --wait --timeout 15m
 
-          echo "🔎 Monitoring stack deployed successfully."
-          kubectl get svc -n ${MONITORING_NS}
+          echo "🔎 Services:"
+          kubectl get svc -n ${MON_NS}
         '''
       }
     }
@@ -151,22 +212,28 @@ pipeline {
     success {
       sh '''
         echo "✅ Deployment Successful!"
-        echo "🌐 App URL:"
+        echo "🌐 App Hostname:"
         kubectl get svc springboot -n ${APP_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
-        echo "📈 Grafana URL:"
-        kubectl get svc kube-prometheus-stack-grafana -n ${MONITORING_NS} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
-        echo "🔑 Grafana Login: admin / prom-operator"
+        echo "📄 Expecting strings on the page:"
+        echo " - ${EXPECT_A}"
+        echo " - ${EXPECT_B}"
+
+        if [ "${SETUP_MONITORING}" = "true" ]; then
+          echo "📈 Grafana Hostname:"
+          kubectl get svc kube-prometheus-stack-grafana -n prometheus -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
+          echo "🔑 Grafana login → admin / prom-operator"
+        fi
       '''
-    }
-    failure {
-      echo "❌ Pipeline failed — check logs for details."
     }
     always {
       sh '''
         docker logout ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com || true
-        rm -rf ${TRIVY_CACHE_DIR} || true
-        cleanWs()
+        # Keep workspace by default for debugging; uncomment to clean
+        # cleanWs()
       '''
+    }
+    failure {
+      echo "❌ Pipeline failed — check stage logs above."
     }
   }
 }
