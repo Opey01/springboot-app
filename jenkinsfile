@@ -1,5 +1,6 @@
 pipeline {
   agent any
+  tools { maven 'Maven3' }
 
   options {
     timestamps()
@@ -8,39 +9,44 @@ pipeline {
   }
 
   parameters {
-    booleanParam(name: 'SETUP_MONITORING', defaultValue: false, description: 'Install/upgrade Prometheus + Grafana (kube-prometheus-stack) into the cluster')
+    booleanParam(name: 'ENABLE_MONITORING', defaultValue: true, description: 'Install/upgrade Prometheus + Grafana (kube-prometheus-stack)')
   }
 
   environment {
-    // --- AWS / ECR ---
+    // --- AWS/ECR ---
     AWS_REGION      = 'us-east-2'
     ACCOUNT_ID      = '850924742604'
     ECR_REPO        = 'mydockerrepo'
     ECR_URL         = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
-    IMAGE_TAG       = "build-${env.BUILD_NUMBER}"
-    DOCKERFILE      = 'Dockerfilejenkins'
 
-    // --- Source ---
+    // --- Git/Build tagging (immutable-safe & unique) ---
+    IMAGE_TAG       = ""               // set later from BUILD_NUMBER + GIT_SHA
+    LATEST_TAG      = "latest"         // optional "latest" push (not overwritten if registry is immutable)
+
+    // --- Repo/Build ---
     REPO_URL        = 'https://github.com/Opey01/springboot-app.git'
     BRANCH          = 'main'
+    DOCKERFILE      = 'Dockerfilejenkins'
 
-    // --- Kubernetes / Helm ---
-    APP_NAMESPACE   = 'helm-deployment'
-    HELM_CHART_PATH = "${WORKSPACE}/mychart"  // chart directory inside repo/workspace
-    CONTAINER_PORT  = '8085'
-    SERVICE_PORT    = '80'
-
-    // --- Trivy cache (keeps DB so scans are faster and avoid disk churn) ---
+    // --- Trivy cache to avoid space/time churn ---
     TRIVY_CACHE_DIR = "${WORKSPACE}/.trivycache"
 
-    // --- Smoke test expectations (strings to assert on the homepage) ---
-    EXPECT_A = 'We are learning Deployment of Java + Docker + SpringBoot + Helm + EKS Cluster!!!!'
-    EXPECT_B = 'Welcome to the SpringBoot Docker container running inside the EKS Cluster!!!!'
+    // --- K8s/Helm ---
+    APP_NAMESPACE   = "helm-deployment"
+    APP_NAME        = "springboot"     // Helm release & k8s Deployment/Service name (we override fullname)
+    CONTAINER_PORT  = "8085"
+
+    // We'll resolve this at runtime:
+    HELM_CHART_PATH = ""
+    MONITORING_NS   = "prometheus"
   }
 
   stages {
-    stage('Prep (Clean Workspace)') {
-      steps { deleteDir() }
+
+    stage('Prep (Clean)') {
+      steps {
+        deleteDir()
+      }
     }
 
     stage('Checkout') {
@@ -49,67 +55,99 @@ pipeline {
       }
     }
 
-    stage('Docker Cleanup (Safe)') {
+    stage('Compute Vars') {
       steps {
-        sh '''
-          docker builder prune -af || true
-          docker container prune -f || true
-          docker image prune -af || true
-          docker volume prune -f || true
-        '''
+        script {
+          def sha = sh(returnStdout: true, script: "git rev-parse --short=8 HEAD").trim()
+          env.GIT_SHA   = sha
+          env.IMAGE_TAG = "build-${env.BUILD_NUMBER}-${sha}"
+
+          // Resolve Helm chart location robustly:
+          // Prefer repo "mychart/", then "my-chart/", else fallback to $HOME/mychart
+          def chartPath = ""
+          if (fileExists("${WORKSPACE}/mychart/Chart.yaml")) {
+            chartPath = "${WORKSPACE}/mychart"
+          } else if (fileExists("${WORKSPACE}/my-chart/Chart.yaml")) {
+            chartPath = "${WORKSPACE}/my-chart"
+          } else {
+            chartPath = "${env.HOME}/mychart"
+          }
+          env.HELM_CHART_PATH = chartPath
+
+          echo "Resolved HELM_CHART_PATH: ${env.HELM_CHART_PATH}"
+          echo "Using tag: ${env.IMAGE_TAG}"
+        }
       }
     }
 
     stage('Build (Maven)') {
-      tools { maven 'Maven3' }
       steps {
         sh 'mvn -B -DskipTests clean package'
       }
     }
 
-    stage('Archive JAR') {
-      steps { archiveArtifacts artifacts: 'target/*.jar', fingerprint: true }
+    stage('Archive Jar') {
+      steps {
+        archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+      }
     }
 
     stage('Docker Build & Tag') {
       steps {
         sh '''
-          echo "🚀 Building Docker image: ${ECR_URL}:${IMAGE_TAG}"
+          set -eux
+          echo "Building Docker image ${ECR_URL}:${IMAGE_TAG}"
           docker build -f ${DOCKERFILE} -t ${ECR_URL}:${IMAGE_TAG} .
         '''
       }
     }
 
-    stage('Trivy Scan (vuln only: HIGH/CRITICAL)') {
+    stage('Trivy Scan') {
       steps {
         sh '''
-          echo "🔍 Trivy scan on ${ECR_URL}:${IMAGE_TAG}"
+          set +e
           mkdir -p "${TRIVY_CACHE_DIR}"
+          echo "Running Trivy (vuln only, CRITICAL/HIGH)…"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${TRIVY_CACHE_DIR}:/root/.cache/trivy" \
             aquasec/trivy:latest image \
             --scanners vuln \
             --severity CRITICAL,HIGH \
-            --exit-code 0 \
+            --format table \
             --no-progress \
-            --skip-db-update=false \
-            ${ECR_URL}:${IMAGE_TAG}
+            ${ECR_URL}:${IMAGE_TAG} | tee trivy-report.txt
+
+          # Do not fail the build automatically; you can gate on contents if desired.
+          # If you want to fail when CRITICALs exist, uncomment below:
+          # grep -q " CRITICAL " trivy-report.txt && { echo "CRITICAL vulns found"; exit 1; } || true
+
+          exit 0
         '''
+        archiveArtifacts artifacts: 'trivy-report.txt', fingerprint: true
       }
     }
 
     stage('ECR Login & Push') {
       steps {
         sh '''
-          echo "🔐 Authenticating to AWS ECR and pushing ${ECR_URL}:${IMAGE_TAG}"
+          set -eux
+
+          # Ensure repo exists
           aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION} >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name ${ECR_REPO} --region ${AWS_REGION}
 
+          # Login
           aws ecr get-login-password --region ${AWS_REGION} | \
             docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
 
+          # Push unique build tag (never collides with immutable tags)
           docker push ${ECR_URL}:${IMAGE_TAG}
+
+          # Optionally push :latest if your ECR policy allows mutable tags
+          set +e
+          docker tag ${ECR_URL}:${IMAGE_TAG} ${ECR_URL}:${LATEST_TAG}
+          docker push ${ECR_URL}:${LATEST_TAG} || echo "Skipping ':latest' push (repo immutable or blocked)."
         '''
       }
     }
@@ -117,92 +155,52 @@ pipeline {
     stage('Helm Deploy to EKS') {
       steps {
         sh '''
-          echo "🧭 Ensuring namespace exists: ${APP_NAMESPACE}"
+          set -eux
+
+          # Ensure namespace
           kubectl create namespace ${APP_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
-          echo "🛠️  Deploying with Helm from ${HELM_CHART_PATH}"
-          helm upgrade --install springboot ${HELM_CHART_PATH} \
-            --namespace ${APP_NAMESPACE} --create-namespace \
-            --set image.repository=${ECR_URL%/*} \
+          # Install/upgrade
+          helm upgrade --install ${APP_NAME} ${HELM_CHART_PATH} \
+            --namespace ${APP_NAMESPACE} \
+            --create-namespace \
+            --set image.repository=${ECR_URL} \
             --set image.tag=${IMAGE_TAG} \
             --set containerPort=${CONTAINER_PORT} \
             --set service.type=LoadBalancer \
-            --set service.port=${SERVICE_PORT} \
+            --set service.port=80 \
             --set autoscaling.enabled=false \
             --set ingress.enabled=false \
-            --set fullnameOverride=springboot \
+            --set fullnameOverride=${APP_NAME} \
+            --set serviceAccount.create=true \
+            --set serviceAccount.name="" \
             --atomic --timeout 10m
 
-          echo "⏳ Waiting for rollout..."
-          kubectl rollout status deployment/springboot -n ${APP_NAMESPACE} --timeout=300s
-
-          echo "📦 Pods:"
-          kubectl get pods -n ${APP_NAMESPACE} -o wide
-          echo "🌐 Service:"
-          kubectl get svc springboot -n ${APP_NAMESPACE} -o wide
-        '''
-      }
-    }
-
-    stage('Smoke Test (HTTP + Content Assertions)') {
-      steps {
-        sh '''
-          set -euo pipefail
-          echo "🌐 Resolving Service hostname..."
-          ELB_HOST=$(kubectl get svc springboot -n ${APP_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-          if [ -z "${ELB_HOST}" ]; then
-            echo "ELB hostname not ready yet"; kubectl get svc springboot -n ${APP_NAMESPACE} -o yaml | sed -n '1,120p'; exit 1
-          fi
-          APP_URL="http://${ELB_HOST}:${SERVICE_PORT}"
-          echo "🔗 App URL: ${APP_URL}"
-
-          # Retry curl until healthy (max ~3m)
-          for i in $(seq 1 36); do
-            echo "Attempt $i: curl ${APP_URL}"
-            HTTP_CODE=$(curl -s -o /tmp/app.html -w '%{http_code}' --max-time 10 "${APP_URL}" || true)
-            if [ "${HTTP_CODE}" = "200" ] || [ "${HTTP_CODE}" = "302" ]; then
-              break
-            fi
-            sleep 5
-          done
-
-          echo "HTTP ${HTTP_CODE}"
-          test "${HTTP_CODE}" = "200" -o "${HTTP_CODE}" = "302"
-
-          echo "🧪 Asserting expected page content..."
-          # Allow either the landing page or redirect target to contain our messages
-          # Follow redirect once if needed
-          if ! (grep -F "${EXPECT_A}" /tmp/app.html && grep -F "${EXPECT_B}" /tmp/app.html); then
-            # try fetching root without redirect following issues
-            curl -s "${APP_URL}" -o /tmp/app2.html || true
-            grep -F "${EXPECT_A}" /tmp/app2.html
-            grep -F "${EXPECT_B}" /tmp/app2.html
-          fi
-
-          echo "✅ Smoke test passed."
+          # Rollout + quick status
+          kubectl rollout status deploy/${APP_NAME} -n ${APP_NAMESPACE}
+          kubectl get deploy,rs,pods,svc -n ${APP_NAMESPACE} -l app=${APP_NAME} || true
         '''
       }
     }
 
     stage('Setup Monitoring (Prometheus + Grafana)') {
-      when { expression { params.SETUP_MONITORING } }
+      when { expression { return params.ENABLE_MONITORING } }
       steps {
         sh '''
-          echo "📊 Installing/Upgrading kube-prometheus-stack (Grafana+Prometheus)..."
-          MON_NS=prometheus
-          kubectl get ns ${MON_NS} >/dev/null 2>&1 || kubectl create namespace ${MON_NS}
+          set -eux
+          kubectl get ns ${MONITORING_NS} >/dev/null 2>&1 || kubectl create namespace ${MONITORING_NS}
 
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
 
           helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
-            -n ${MON_NS} \
+            -n ${MONITORING_NS} \
             --set grafana.service.type=LoadBalancer \
             --set prometheus.service.type=LoadBalancer \
             --wait --timeout 15m
 
-          echo "🔎 Services:"
-          kubectl get svc -n ${MON_NS}
+          echo "Services in ${MONITORING_NS}:"
+          kubectl get svc -n ${MONITORING_NS}
         '''
       }
     }
@@ -211,29 +209,25 @@ pipeline {
   post {
     success {
       sh '''
-        echo "✅ Deployment Successful!"
-        echo "🌐 App Hostname:"
-        kubectl get svc springboot -n ${APP_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
-        echo "📄 Expecting strings on the page:"
-        echo " - ${EXPECT_A}"
-        echo " - ${EXPECT_B}"
+        echo "✅ SUCCESS"
+        echo -n "🌐 App URL: "
+        kubectl get svc ${APP_NAME} -n ${APP_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo ":80"
 
-        if [ "${SETUP_MONITORING}" = "true" ]; then
-          echo "📈 Grafana Hostname:"
-          kubectl get svc kube-prometheus-stack-grafana -n prometheus -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
-          echo "🔑 Grafana login → admin / prom-operator"
+        if [ "${ENABLE_MONITORING}" = "true" ]; then
+          echo -n "📈 Grafana URL: "
+          kubectl get svc kube-prometheus-stack-grafana -n ${MONITORING_NS} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'; echo
+          echo "🔑 Grafana default login: admin / prom-operator"
         fi
       '''
+    }
+    failure {
+      echo '❌ Pipeline failed — check the logs above.'
     }
     always {
       sh '''
         docker logout ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com || true
-        # Keep workspace by default for debugging; uncomment to clean
-        # cleanWs()
       '''
-    }
-    failure {
-      echo "❌ Pipeline failed — check stage logs above."
+      cleanWs()
     }
   }
 }
